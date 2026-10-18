@@ -64,7 +64,7 @@ function toRecs(S){
   S.credits.forEach(k=>R['cred:'+k.id]=k);
   [...S.buys].reverse().forEach(b=>R['buy:'+b.id]=b);
   [...S.hist].reverse().forEach(r=>R['hist:'+r.id]=r);
-  S.log.forEach(e=>R['log:'+e.id]=e);
+  S.log.forEach(e=>{if(!e.id)e.id=uid();R['log:'+e.id]=e});
   R['cash:meta']=meta;
   (sales||[]).forEach(x=>R['sale:'+x.id]=x);(tabs||[]).forEach(x=>R['tab:'+x.id]=x);
   (expenses||[]).forEach(x=>R['exp:'+x.id]=x);(cols||[]).forEach(x=>R['col:'+x.id]=x);
@@ -111,7 +111,16 @@ async function sync(full){
   }finally{saving=false;lastSave=Date.now()}
 }
 const save=()=>{sync()};
-function applyState(r){me=r.me;S=fromRecs(r.rows,r.users);base={};r.rows.forEach(x=>base[x.k]=canon(x.v));sig=r.sig||''}
+function rebuildLog(){
+  const out=new Map(),addAll=c=>{
+    (c.sales||[]).forEach(s=>out.set(s.id,{id:s.id,t:s.t,type:'sale',total:s.total,paid:s.paid??s.total,credit:s.credit||0,method:s.method||'cash',items:(s.items||[]).map(i=>({name:i.name,amt:i.price*i.qty,qty:i.qty}))}));
+    (c.expenses||[]).forEach(e=>out.set(e.id,{id:e.id,t:e.t,type:'exp',amount:e.amount,desc:e.desc}));
+    (c.cols||[]).forEach(e=>out.set(e.id,{id:e.id,t:e.t,type:'col',amount:e.amount,method:e.method||'cash',client:e.client}))};
+  S.hist.forEach(r=>{if(r.snap)addAll(r.snap)});addAll(S.cash);
+  S.log=S.log.filter(e=>e.id&&e.type==='buy').concat([...out.values()]).sort((a,b)=>a.t-b.t);
+  save();
+}
+function applyState(r){me=r.me;S=fromRecs(r.rows,r.users);base={};r.rows.forEach(x=>base[x.k]=canon(x.v));sig=r.sig||'';if(me&&me.role==='admin'&&S.log.some(e=>!e.id))rebuildLog()}
 async function refresh(force){const r=await api('/api/state',{});applyState(r);if(force)render()}
 async function poll(){
   if(!token||saving||pollBusy)return;pollBusy=true;const t0=Date.now();
@@ -157,9 +166,12 @@ function go(t){tab=t;rep=null;rcpt=null;render()}
 /* ---------- Caja ---------- */
 let cur=null,per=1,rcpt=null;
 const today0=()=>{const d=new Date();d.setHours(0,0,0,0);return d.getTime()};
-const cin=c=>c.sales.reduce((a,s)=>a+(s.paid??s.total),0);
+const isCard=x=>x.method==='card';
+const cin=c=>c.sales.reduce((a,s)=>a+(isCard(s)?0:(s.paid??s.total)),0);
+const cardS=c=>c.sales.reduce((a,s)=>a+(isCard(s)?(s.paid??s.total):0),0);
+const ccolCard=c=>c.cols.reduce((a,e)=>a+(isCard(e)?e.amount:0),0);
 const cexp=c=>c.expenses.reduce((a,e)=>a+e.amount,0);
-const ccol=c=>c.cols.reduce((a,e)=>a+e.amount,0);
+const ccol=c=>c.cols.reduce((a,e)=>a+(isCard(e)?0:e.amount),0);
 const expected=c=>c.fund+cin(c)+ccol(c)-cexp(c);
 const tabTotal=t=>t.items.reduce((a,i)=>a+i.qty*i.price,0);
 const curTab=()=>S.cash.tabs.find(t=>t.id===cur);
@@ -174,14 +186,14 @@ function askClose(){
 }
 function closeCash(cv){
   const c=S.cash,counted=cv===''?null:parseFloat(cv);
-  const r={id:uid(),open:c.at,close:Date.now(),openedBy:c.by,closedBy:me.name,fund:c.fund,total:c.sales.reduce((a,s)=>a+s.total,0),paid:cin(c),credit:c.sales.reduce((a,s)=>a+(s.credit||0),0),disc:c.sales.reduce((a,s)=>a+(s.discount||0),0),cols:c.cols,expenses:c.expenses,exp:expected(c),counted,items:sold(c.sales),n:c.sales.length,snap:c};
+  const r={id:uid(),open:c.at,close:Date.now(),openedBy:c.by,closedBy:me.name,fund:c.fund,total:c.sales.reduce((a,s)=>a+s.total,0),paid:cin(c)+cardS(c),cardPaid:cardS(c)+ccolCard(c),credit:c.sales.reduce((a,s)=>a+(s.credit||0),0),disc:c.sales.reduce((a,s)=>a+(s.discount||0),0),cols:c.cols,expenses:c.expenses,exp:expected(c),counted,items:sold(c.sales),n:c.sales.length,snap:c};
   S.hist.unshift(r);S.cash={open:false};save();
   if(isAdmin()){rep=r;render()}else ask('Caja cerrada',[],null,'La caja del día se cerró. Solo el administrador puede reabrirla o ver el cierre.');
 }
 function reopen(i){ask('Reabrir caja',[],()=>{if(S.cash.open)return alert('Ya hay una caja abierta');const r=S.hist[i];S.cash={...r.snap,open:true};S.hist.splice(i,1);rep=null;save()},'¿Reabrir este cierre? Volverás a la caja con sus ventas y gastos.')}
 function addExp(){ask('Gasto de caja',[{label:'¿En qué se gastó? (luz, agua, limpieza…)'},{label:'Monto (RD$)',type:'number'}],v=>{
   const a=parseFloat(v[1]);if(!v[0].trim()||!(a>0))return alert('Escribe el motivo y un monto válido');
-  const e={id:uid(),t:Date.now(),desc:v[0].trim(),amount:a,by:me.name};S.cash.expenses.push(e);S.log.push({t:e.t,type:'exp',amount:a,desc:e.desc});save()})}
+  const e={id:uid(),t:Date.now(),desc:v[0].trim(),amount:a,by:me.name};S.cash.expenses.push(e);S.log.push({id:e.id,t:e.t,type:'exp',amount:a,desc:e.desc});save()})}
 function reportHTML(r){
   const d=t=>new Date(t).toLocaleString('es-DO'),fi=(r.snap?.sales||[]).filter(s=>s.credit>0);
   return`<div class="card rep"><h2 style="text-align:center;margin:0">She &amp; He</h2>
@@ -191,9 +203,10 @@ function reportHTML(r){
   ${r.items.map(i=>`<tr><td>${esc(i.name)}</td><td class="r">${i.qty}</td><td class="r">${i.price}</td><td class="r">${i.qty*i.price}</td></tr>`).join('')||'<tr><td colspan="4">Sin ventas</td></tr>'}</table></div><hr>
   <div class="sp"><span>Ventas (${r.n})</span><b>${money(r.total)}</b></div>
   <div class="sp"><span>Cobrado en ventas</span><span>${money(r.paid??r.total)}</span></div>
+  ${r.cardPaid?`<div class="sp"><span>Pagos con tarjeta (no son efectivo)</span><span>${money(r.cardPaid)}</span></div>`:''}
   ${r.disc?`<div class="sp"><span>Descuentos otorgados (ya restados)</span><span>${money(r.disc)}</span></div>`:''}
   ${fi.map(s=>`<div class="sp"><span>Fiado a ${esc(s.client)}</span><span>${money(s.credit)}</span></div>`).join('')}
-  ${(r.cols||[]).map(x=>`<div class="sp"><span>Pago de ${esc(x.client)} (crédito anterior)</span><span>+${money(x.amount)}</span></div>`).join('')}
+  ${(r.cols||[]).map(x=>`<div class="sp"><span>Pago de ${esc(x.client)} (crédito anterior)${x.method==='card'?' · tarjeta':''}</span><span>+${money(x.amount)}</span></div>`).join('')}
   ${(r.expenses||[]).map(x=>`<div class="sp"><span>Gasto: ${esc(x.desc)}</span><span>−${money(x.amount)}</span></div>`).join('')}
   <div class="sp"><span>Fondo inicial</span><span>${money(r.fund)}</span></div>
   <div class="sp"><span>Efectivo esperado</span><b>${money(r.exp)}</b></div>
@@ -211,7 +224,8 @@ function vCaja(){
     <div class="sp"><span>Fondo inicial</span><span>${money(c.fund)}</span></div>
     <div class="sp"><span>Ventas (${c.sales.length})</span><span>${money(tv)}</span></div>
     <div class="sp"><span>Fiado hoy</span><span>${money(fi)}</span></div>
-    <div class="sp"><span>Cobros de créditos</span><span>${money(ccol(c))}</span></div>
+    <div class="sp"><span>Cobros de créditos (efectivo)</span><span>${money(ccol(c))}</span></div>
+    <div class="sp"><span>Cobrado con tarjeta</span><span>${money(cardS(c)+ccolCard(c))}</span></div>
     <div class="sp"><span>Gastos de caja</span><span>−${money(cexp(c))}</span></div>
     <div class="sp"><span>Efectivo esperado</span><b class="tot">${money(expected(c))}</b></div></div>
     <div class="card"><div class="sp"><b>Gastos de caja</b><button onclick="addExp()">+ Gasto</button></div>${c.expenses.map(e=>`<div class="sp"><span>${esc(e.desc)} <small class="mu">${esc(e.by)}</small></span><span>${money(e.amount)}</span></div>`).join('')||'<p class="mu">Sin gastos</p>'}</div>
@@ -231,12 +245,12 @@ function add(id){const t=curTab(),p=S.prods.find(x=>x.id===id);if(!t||p.stock<=0
 function chg(id,d){const t=curTab(),p=S.prods.find(x=>x.id===id),i=t.items.find(x=>x.pid===id);if(d>0&&p&&p.stock<=0)return;i.qty+=d;if(p)p.stock-=d;if(i.qty<=0)t.items=t.items.filter(x=>x!==i);save();render()}
 function cancelTab(){const t=curTab();ask('Cancelar cuenta',[],()=>{t.items.forEach(i=>{const p=S.prods.find(x=>x.id===i.pid);if(p)p.stock+=i.qty});S.cash.tabs=S.cash.tabs.filter(x=>x!==t);cur=null;save()},'¿Cancelar la cuenta de '+t.name+'? Los productos vuelven al inventario.',true)}
 function payTab(){const t=curTab(),sub=tabTotal(t);if(!sub)return;
-  ask('Cobrar a '+t.name+' · '+money(sub),[{label:'Descuento: tipo',value:'m',opts:[['m','Monto (RD$)'],['p','Porcentaje (%)']]},{label:'Descuento: valor (vacío = sin descuento)',type:'number'},{label:'Monto recibido (vacío = paga todo; si es menor, el resto queda fiado)',type:'number'}],v=>{
-    const dv=parseFloat(v[1])||0,disc=Math.round(Math.min(sub,Math.max(0,v[0]==='p'?sub*dv/100:dv))*100)/100,tot=sub-disc;
-    const r=v[2]===''?tot:parseFloat(v[2]);if(isNaN(r)||r<0)return alert('Monto recibido inválido');
-    const paid=Math.min(r,tot),credit=Math.round((tot-paid)*100)/100,change=r-paid;
-    const s={id:uid(),t:Date.now(),client:t.name,items:t.items.map(({pid,name,price,qty})=>({pid,name,price,qty})),subtotal:sub,discount:disc,total:tot,paid,credit,change,by:me.name};
-    S.cash.sales.push(s);S.log.push({t:s.t,type:'sale',total:tot,paid,credit,items:s.items.map(i=>({name:i.name,amt:i.price*i.qty,qty:i.qty}))});
+  ask('Cobrar a '+t.name+' · '+money(sub),[{label:'Forma de pago',value:'cash',opts:[['cash','Efectivo'],['card','Tarjeta']]},{label:'Descuento: tipo',value:'m',opts:[['m','Monto (RD$)'],['p','Porcentaje (%)']]},{label:'Descuento: valor (vacío = sin descuento)',type:'number'},{label:'Monto recibido (vacío = paga todo; si es menor, el resto queda fiado)',type:'number'}],v=>{
+    const method=v[0]==='card'?'card':'cash',dv=parseFloat(v[2])||0,disc=Math.round(Math.min(sub,Math.max(0,v[1]==='p'?sub*dv/100:dv))*100)/100,tot=sub-disc;
+    const r=v[3]===''?tot:parseFloat(v[3]);if(isNaN(r)||r<0)return alert('Monto recibido inválido');
+    const paid=Math.min(r,tot),credit=Math.round((tot-paid)*100)/100,change=method==='card'?0:r-paid;
+    const s={id:uid(),t:Date.now(),client:t.name,items:t.items.map(({pid,name,price,qty})=>({pid,name,price,qty})),subtotal:sub,discount:disc,total:tot,paid,credit,change,method,by:me.name};
+    S.cash.sales.push(s);S.log.push({id:s.id,t:s.t,type:'sale',total:tot,paid,credit,method,items:s.items.map(i=>({name:i.name,amt:i.price*i.qty,qty:i.qty}))});
     if(credit>0)S.credits.push({id:uid(),client:t.name,total:credit,paid:0,date:s.t,pays:[],by:me.name});
     S.cash.tabs=S.cash.tabs.filter(x=>x!==t);cur=null;rcpt=s;save();
   })}
@@ -247,7 +261,7 @@ function receiptHTML(s){
   <div class="wrap"><table><tr><th>Producto</th><th class="r">Cant</th><th class="r">Precio</th><th class="r">Total</th></tr>${s.items.map(i=>`<tr><td>${esc(i.name)}</td><td class="r">${i.qty}</td><td class="r">${i.price}</td><td class="r">${i.qty*i.price}</td></tr>`).join('')}</table></div><hr>
   ${dsc?`<div class="sp"><span>Subtotal</span><span>${money(sub)}</span></div><div class="sp"><span>Descuento</span><span>−${money(dsc)}</span></div>`:''}
   <div class="sp"><span><b>Total</b></span><b>${money(s.total)}</b></div>
-  <div class="sp"><span>Pagado</span><span>${money(s.paid??s.total)}</span></div>
+  <div class="sp"><span>Pagado (${s.method==='card'?'tarjeta':'efectivo'})</span><span>${money(s.paid??s.total)}</span></div>
   ${s.credit>0?`<div class="sp"><span>Pendiente (fiado)</span><b class="bad">${money(s.credit)}</b></div>`:''}
   ${s.change>0?`<div class="sp"><span>Devuelta</span><span>${money(s.change)}</span></div>`:''}
   <p style="text-align:center;margin:12px 0 0">¡Gracias por su visita!</p>
@@ -321,7 +335,7 @@ function receiptLines(s){
   s.items.forEach(i=>L.push(pad(i.qty+' x '+String(i.name).slice(0,30),m(i.qty*i.price))));
   L.push('-'.repeat(W));
   if(dsc)L.push(pad('Subtotal',m(sub)),pad('Descuento','-'+m(dsc)));
-  L.push(pad('TOTAL',m(s.total)),pad('Pagado',m(s.paid??s.total)));
+  L.push(pad('TOTAL',m(s.total)),pad('Pagado ('+(s.method==='card'?'tarjeta':'efectivo')+')',m(s.paid??s.total)));
   if(s.credit>0)L.push(pad('Pendiente (fiado)',m(s.credit)));
   if(s.change>0)L.push(pad('Devuelta',m(s.change)));
   L.push('',ctr('¡Gracias por su visita!'));return L;
@@ -332,9 +346,10 @@ function reportLines(r){
   r.items.forEach(i=>L.push(pad(String(i.name).slice(0,26),i.qty+' x '+i.price+' = '+i.qty*i.price)));
   if(!r.items.length)L.push('Sin ventas');
   L.push('-'.repeat(W),pad('Ventas ('+r.n+')',m(r.total)),pad('Cobrado en ventas',m(r.paid??r.total)));
+  if(r.cardPaid)L.push(pad('Pagos con tarjeta (no efectivo)',m(r.cardPaid)));
   if(r.disc)L.push(pad('Descuentos otorgados (ya restados)',m(r.disc)));
   fi.forEach(s=>L.push(pad('Fiado a '+s.client,m(s.credit))));
-  (r.cols||[]).forEach(x=>L.push(pad('Pago de '+x.client+' (crédito anterior)','+'+m(x.amount))));
+  (r.cols||[]).forEach(x=>L.push(pad('Pago de '+x.client+' (crédito anterior)'+(x.method==='card'?' [tarjeta]':''),'+'+m(x.amount))));
   (r.expenses||[]).forEach(x=>L.push(pad('Gasto: '+x.desc,'-'+m(x.amount))));
   L.push(pad('Fondo inicial',m(r.fund)),pad('Efectivo esperado',m(r.exp)));
   if(r.counted!=null)L.push(pad('Efectivo contado',m(r.counted)),pad('Diferencia',m(r.counted-r.exp)));
@@ -423,10 +438,10 @@ function donutHTML(L){
 /* ---------- Créditos y estadísticas ---------- */
 function payCredit(id){const k=S.credits.find(x=>x.id===id),b=k.total-k.paid;
   if(!S.cash.open)return alert('Abre la caja para registrar cobros');
-  ask('Cobrar a '+k.client+' · debe '+money(b),[{label:'Monto que paga',type:'number',value:b}],v=>{
-    const a=Math.min(parseFloat(v[0]),b);if(!(a>0))return alert('Monto inválido');
-    k.paid+=a;k.pays.push({t:Date.now(),amount:a,by:me.name});
-    const e={id:uid(),t:Date.now(),client:k.client,amount:a};S.cash.cols.push(e);S.log.push({t:e.t,type:'col',amount:a,client:k.client});save()})}
+  ask('Cobrar a '+k.client+' · debe '+money(b),[{label:'Forma de pago',value:'cash',opts:[['cash','Efectivo'],['card','Tarjeta']]},{label:'Monto que paga',type:'number',value:b}],v=>{
+    const a=Math.min(parseFloat(v[1]),b),method=v[0]==='card'?'card':'cash';if(!(a>0))return alert('Monto inválido');
+    k.paid+=a;k.pays.push({t:Date.now(),amount:a,method,by:me.name});
+    const e={id:uid(),t:Date.now(),client:k.client,amount:a,method};S.cash.cols.push(e);S.log.push({id:e.id,t:e.t,type:'col',amount:a,method,client:k.client});save()})}
 function vCred(){
   const pend=S.credits.filter(k=>k.total-k.paid>0.009),tot=pend.reduce((a,k)=>a+k.total-k.paid,0);
   return`<div class="card"><div class="sp"><span>Total por cobrar</span><span class="tot bad">${money(tot)}</span></div></div>
@@ -437,10 +452,11 @@ function vStats(){
   const from=today0()-(per-1)*864e5,L=S.log.filter(e=>e.t>=from);
   const sm=(ty,k)=>L.filter(e=>e.type===ty).reduce((a,e)=>a+e[k],0);
   const vend=sm('sale','total'),inc=sm('sale','paid')+sm('col','amount'),exp=sm('exp','amount'),buy=sm('buy','amount'),net=inc-exp-buy;
+  const cardInc=L.filter(e=>e.method==='card'&&(e.type==='sale'||e.type==='col')).reduce((a,e)=>a+(e.type==='sale'?e.paid:e.amount),0);
   const pend=S.credits.reduce((a,k)=>a+k.total-k.paid,0),days={},pp={};
   L.forEach(e=>{if(e.type==='sale')(e.items||[]).forEach(i=>{(pp[i.name]=pp[i.name]||{v:0,c:0}).v+=i.amt});if(e.type==='buy')(pp[e.name]=pp[e.name]||{v:0,c:0}).c+=e.amount;const k=new Date(e.t).toLocaleDateString('es-DO'),d=days[k]=days[k]||{i:0,g:0};if(e.type==='sale')d.i+=e.paid;if(e.type==='col')d.i+=e.amount;if(e.type==='exp'||e.type==='buy')d.g+=e.amount});
   return`<div class="row" style="margin-bottom:10px">${[[1,'Hoy'],[7,'7 días'],[30,'30 días']].map(p=>`<button class="${p[0]===per?'':'g'}" onclick="per=${p[0]};render()">${p[1]}</button>`).join('')}</div>
-  <div class="card"><div class="sp"><span>Vendido (total)</span><b>${money(vend)}</b></div><div class="sp"><span>Ingresos cobrados</span><b class="ok">${money(inc)}</b></div><div class="sp"><span>Gastos de caja</span><b class="bad">−${money(exp)}</b></div><div class="sp"><span>Compras (cajas, mercancía)</span><b class="bad">−${money(buy)}</b></div>
+  <div class="card"><div class="sp"><span>Vendido (total)</span><b>${money(vend)}</b></div><div class="sp"><span>Ingresos cobrados</span><b class="ok">${money(inc)}</b></div><div class="sp"><span class="mu">· en efectivo</span><span>${money(inc-cardInc)}</span></div><div class="sp"><span class="mu">· con tarjeta</span><span>${money(cardInc)}</span></div><div class="sp"><span>Gastos de caja</span><b class="bad">−${money(exp)}</b></div><div class="sp"><span>Compras (cajas, mercancía)</span><b class="bad">−${money(buy)}</b></div>
   <div class="sp"><span>Ganancia (ingresos − gastos − compras)</span><span class="tot ${net<0?'bad':''}">${money(net)}</span></div></div>
   <div class="card"><div class="sp"><span>Ingresos pendientes (fiados)</span><b class="bad">${money(pend)}</b></div><p class="mu" style="margin:0;font-size:13px">No cuentan como ganancia hasta que se cobren.</p></div>
   ${donutHTML(L)}${Object.keys(pp).length?`<div class="card wrap"><b>Por producto</b><table><tr><th>Producto</th><th class="r">Vendido</th><th class="r">Comprado</th><th class="r">Diferencia</th></tr>${Object.entries(pp).map(([k,d])=>`<tr><td>${esc(k)}</td><td class="r">${money(d.v)}</td><td class="r">${money(d.c)}</td><td class="r ${d.v-d.c<0?'bad':'ok'}">${money(d.v-d.c)}</td></tr>`).join('')}</table><p class="mu" style="font-size:13px">Compara lo vendido con lo que pagaste por cajas en este período.</p></div>`:''}${per>1?`<div class="card wrap"><table><tr><th>Día</th><th class="r">Ingresos</th><th class="r">Gastos</th><th class="r">Neto</th></tr>${Object.entries(days).reverse().map(([k,d])=>`<tr><td>${k}</td><td class="r">${money(d.i)}</td><td class="r">${money(d.g)}</td><td class="r">${money(d.i-d.g)}</td></tr>`).join('')}</table></div>`:''}
